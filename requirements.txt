@@ -1,0 +1,17 @@
+# Core dependencies for benchmark_qwen/pipeline/ford_2agent_qwen.py
+torch>=2.2
+transformers>=4.45
+accelerate>=0.30
+safetensors>=0.4
+sentencepiece>=0.2
+
+# Tests
+pytest>=8.0
+
+# Legacy FORD reference scripts in the repository
+jsonlines>=4.0
+tqdm>=4.66
+openai>=1.0
+backoff>=2.2
+fire>=0.6
+fairscale>=0.4
