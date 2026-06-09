@@ -28,7 +28,6 @@ logs/
 results/
 runs/
 
-benchmark_qwen/data/processed/
 benchmark_qwen/outputs/
 benchmark_qwen/results/
 benchmark_qwen/logs/

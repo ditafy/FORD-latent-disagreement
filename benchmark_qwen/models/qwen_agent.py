@@ -15,6 +15,14 @@ DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct"
 
 
 @dataclass
+class QwenBackend:
+    tokenizer: Any
+    model: Any
+    device: str
+    dtype: str
+
+
+@dataclass
 class AgentGeneration:
     response_text: str
     prediction: str
@@ -119,6 +127,62 @@ def extract_prediction(response_text: str, choices: Sequence[str]) -> str:
     return "unknown"
 
 
+_BACKEND_CACHE: dict[tuple[str, str, str], QwenBackend] = {}
+
+
+def clear_qwen_backend_cache() -> None:
+    """Clear loaded model backends, mainly for CPU-only tests."""
+    _BACKEND_CACHE.clear()
+
+
+def resolve_device(device: str | None = None) -> str:
+    return device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def resolve_torch_dtype(dtype: str) -> str | torch.dtype:
+    if dtype == "auto":
+        return "auto"
+    return getattr(torch, dtype)
+
+
+def get_qwen_backend(
+    model_name_or_path: str = DEFAULT_MODEL_NAME,
+    *,
+    device: str | None = None,
+    dtype: str = "auto",
+) -> QwenBackend:
+    """Load or reuse a tokenizer/model pair shared by multiple role agents."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    resolved_device = resolve_device(device)
+    cache_key = (model_name_or_path, resolved_device, dtype)
+    if cache_key in _BACKEND_CACHE:
+        return _BACKEND_CACHE[cache_key]
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        torch_dtype=resolve_torch_dtype(dtype),
+        device_map="auto" if resolved_device == "cuda" else None,
+        trust_remote_code=True,
+    )
+    if resolved_device != "cuda":
+        model.to(resolved_device)
+    model.eval()
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    backend = QwenBackend(
+        tokenizer=tokenizer,
+        model=model,
+        device=resolved_device,
+        dtype=dtype,
+    )
+    _BACKEND_CACHE[cache_key] = backend
+    return backend
+
+
 class QwenAgent:
     """Single local Qwen persona used as a FORD debate agent."""
 
@@ -130,30 +194,16 @@ class QwenAgent:
         device: str | None = None,
         dtype: str = "auto",
     ) -> None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
         self.model_name_or_path = model_name_or_path
         self.persona = persona
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        torch_dtype: str | torch.dtype
-        if dtype == "auto":
-            torch_dtype = "auto"
-        else:
-            torch_dtype = getattr(torch, dtype)
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.backend = get_qwen_backend(
             model_name_or_path,
-            torch_dtype=torch_dtype,
-            device_map="auto" if self.device == "cuda" else None,
-            trust_remote_code=True,
+            device=device,
+            dtype=dtype,
         )
-        if self.device != "cuda":
-            self.model.to(self.device)
-        self.model.eval()
-
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer = self.backend.tokenizer
+        self.model = self.backend.model
+        self.device = self.backend.device
 
     def generate(
         self,
