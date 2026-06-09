@@ -23,6 +23,7 @@ class DummyAgent:
         self.vectors = vectors
         self.prediction = prediction
         self.calls = 0
+        self.seen_messages = []
 
     def generate(
         self,
@@ -34,6 +35,7 @@ class DummyAgent:
     ) -> AgentGeneration:
         if not messages or "Previous debate transcript:" not in messages[0]["content"]:
             raise AssertionError("pipeline did not pass the expected FORD debate prompt")
+        self.seen_messages.append(messages)
 
         vector = self.vectors[min(self.calls, len(self.vectors) - 1)]
         self.calls += 1
@@ -117,8 +119,61 @@ def test_pipeline_smoke() -> None:
             require(Path(round_summary["agent_b_hidden_state_path"]).exists(), "B hidden state file missing")
 
 
+def test_stance_role_mode() -> None:
+    agent_a = DummyAgent(
+        "Affirmative",
+        vectors=[torch.tensor([[1.0, 0.0]])],
+        prediction="yes",
+    )
+    agent_b = DummyAgent(
+        "Negative",
+        vectors=[torch.tensor([[0.0, 1.0]])],
+        prediction="no",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_dir = Path(tmp_dir)
+        summaries = run_pipeline(
+            [sample_record()],
+            agent_a=agent_a,
+            agent_b=agent_b,
+            rounds=1,
+            max_new_tokens=32,
+            temperature=0.0,
+            output_dir=output_dir,
+            role_mode="stance",
+        )
+
+        require(len(summaries) == 1, "expected one stance summary")
+        summary = summaries[0]
+        require(summary["role_mode"] == "stance", "role mode should be recorded")
+        require(summary["agent_a_role"] == "Affirmative", "agent A should be affirmative in stance mode")
+        require(summary["agent_b_role"] == "Negative", "agent B should be negative in stance mode")
+        require(summary["agent_a_target_label"] == "yes", "StrategyQA affirmative target should be yes")
+        require(summary["agent_b_target_label"] == "no", "StrategyQA negative target should be no")
+        require(summary["verdict"] == "unresolved", "opposing stance predictions should not be consensus")
+        require(summary["consensus"] is False, "opposing stance predictions should not be consensus")
+
+        round_summary = summary["rounds"][0]
+        require(round_summary["agent_a_role"] == "Affirmative", "round A role mismatch")
+        require(round_summary["agent_b_role"] == "Negative", "round B role mismatch")
+        require(round_summary["agent_a_target_label"] == "yes", "round A target mismatch")
+        require(round_summary["agent_b_target_label"] == "no", "round B target mismatch")
+
+        affirmative_prompt = agent_a.seen_messages[0][0]["content"]
+        negative_prompt = agent_b.seen_messages[0][0]["content"]
+        require("Role instructions:" in affirmative_prompt, "affirmative prompt should include role instructions")
+        require("assigned side is affirmative" in affirmative_prompt, "affirmative prompt should state assigned side")
+        require("target answer label is 'yes'" in affirmative_prompt, "affirmative prompt should state target")
+        require("Do not switch sides" in affirmative_prompt, "affirmative prompt should prevent side switching")
+        require("Role instructions:" in negative_prompt, "negative prompt should include role instructions")
+        require("assigned side is negative" in negative_prompt, "negative prompt should state assigned side")
+        require("target answer label is 'no'" in negative_prompt, "negative prompt should state target")
+
+
 def main() -> None:
     test_pipeline_smoke()
+    test_stance_role_mode()
     print("[2-agent pipeline smoke test passed]")
 
 

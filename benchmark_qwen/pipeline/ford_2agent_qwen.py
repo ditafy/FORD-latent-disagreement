@@ -6,13 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 import torch
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from benchmark_qwen.metrics.hidden_state_metrics import convergence_delta, pairwise_disagreement
 from benchmark_qwen.models.qwen_agent import AgentGeneration, QwenAgent
+from benchmark_qwen.pipeline.task_specs import RoleConfig, create_role_configs
 
 
 DEFAULT_AGENT_A_PERSONA = (
@@ -23,6 +29,11 @@ DEFAULT_AGENT_B_PERSONA = (
     "You are Agent B, a skeptical fact-checker. Look for weaknesses, alternative "
     "interpretations, and misleading surface cues before answering briefly."
 )
+DEFAULT_STANCE_AGENT_PERSONA = (
+    "You are a debate participant. Follow the role instructions in each prompt exactly, "
+    "argue from the assigned side, and keep the requested answer format."
+)
+ROLE_MODES = ("persona", "stance")
 
 
 class DebateAgent(Protocol):
@@ -90,15 +101,16 @@ def build_messages(
     agent_id: str,
     round_index: int,
     transcript: list[dict[str, Any]],
+    role_config: RoleConfig | None = None,
 ) -> list[dict[str, str]]:
-    if round_index == 0:
+    if role_config is None and round_index == 0:
         instruction = (
             f"You are {agent_id}. Give your initial answer and a short explanation. "
             "Use exactly this format:\n"
             "Answer: (<choice letter>) <choice label>\n"
             "Explanation: <brief reason>"
         )
-    else:
+    elif role_config is None:
         instruction = (
             f"You are {agent_id}. Read the question and previous debate turns. "
             "You may defend your previous view or revise it if the other agent is more convincing. "
@@ -106,11 +118,32 @@ def build_messages(
             "Answer: (<choice letter>) <choice label>\n"
             "Explanation: <brief reason>"
         )
+    elif round_index == 0:
+        instruction = (
+            f"You are {role_config.name}. Your assigned side is {role_config.side}. "
+            f"Your target answer label is '{role_config.target_label}'. Give your opening argument "
+            "for that label. Do not switch sides. Use exactly this format:\n"
+            "Answer: (<choice letter>) <choice label>\n"
+            "Explanation: <brief reason>"
+        )
+    else:
+        instruction = (
+            f"You are {role_config.name}. Read the question and previous debate turns. "
+            f"Defend your assigned side and target answer label '{role_config.target_label}'. "
+            "Rebut the opposing side when needed, but do not switch sides. Use exactly this format:\n"
+            "Answer: (<choice letter>) <choice label>\n"
+            "Explanation: <brief reason>"
+        )
+
+    role_block = ""
+    if role_config is not None:
+        role_block = f"Role instructions:\n{role_config.meta_prompt}\n\n"
 
     content = (
         f"Task type: {record['task_type']}\n"
         f"Input:\n{record['text']}\n\n"
         f"Choices: {choice_text(record['choices'])}\n\n"
+        f"{role_block}"
         f"Previous debate transcript:\n{render_transcript(transcript)}\n\n"
         f"{instruction}"
     )
@@ -144,14 +177,30 @@ def run_sample(
     temperature: float,
     output_dir: Path,
     save_hidden_states: bool = False,
+    role_mode: str = "persona",
 ) -> dict[str, Any]:
+    if role_mode not in ROLE_MODES:
+        raise ValueError(f"role_mode must be one of {ROLE_MODES}, got {role_mode!r}")
+
     transcript: list[dict[str, Any]] = []
     round_summaries: list[dict[str, Any]] = []
     agent_a_predictions: list[str] = []
     agent_b_predictions: list[str] = []
+    agent_a_role: RoleConfig | None = None
+    agent_b_role: RoleConfig | None = None
+    if role_mode == "stance":
+        agent_a_role, agent_b_role = create_role_configs(record)
+    agent_a_id = agent_a_role.name if agent_a_role else "Agent A"
+    agent_b_id = agent_b_role.name if agent_b_role else "Agent B"
 
     for round_index in range(rounds):
-        messages_a = build_messages(record, agent_id="Agent A", round_index=round_index, transcript=transcript)
+        messages_a = build_messages(
+            record,
+            agent_id=agent_a_id,
+            round_index=round_index,
+            transcript=transcript,
+            role_config=agent_a_role,
+        )
         result_a = agent_a.generate(
             messages_a,
             choices=record["choices"],
@@ -168,13 +217,22 @@ def run_sample(
         )
         turn_a = {
             "round": round_index,
-            "agent_id": "Agent A",
+            "agent_id": agent_a_id,
             "prediction": result_a.prediction,
             "response_text": result_a.response_text,
         }
+        if agent_a_role is not None:
+            turn_a["side"] = agent_a_role.side
+            turn_a["target_label"] = agent_a_role.target_label
         transcript.append(turn_a)
 
-        messages_b = build_messages(record, agent_id="Agent B", round_index=round_index, transcript=transcript)
+        messages_b = build_messages(
+            record,
+            agent_id=agent_b_id,
+            round_index=round_index,
+            transcript=transcript,
+            role_config=agent_b_role,
+        )
         result_b = agent_b.generate(
             messages_b,
             choices=record["choices"],
@@ -191,10 +249,13 @@ def run_sample(
         )
         turn_b = {
             "round": round_index,
-            "agent_id": "Agent B",
+            "agent_id": agent_b_id,
             "prediction": result_b.prediction,
             "response_text": result_b.response_text,
         }
+        if agent_b_role is not None:
+            turn_b["side"] = agent_b_role.side
+            turn_b["target_label"] = agent_b_role.target_label
         transcript.append(turn_b)
 
         disagreement = pairwise_disagreement(result_a.pooled_hidden_state, result_b.pooled_hidden_state)
@@ -204,6 +265,10 @@ def run_sample(
             {
                 "round": round_index,
                 "disagreement": disagreement,
+                "agent_a_role": agent_a_id,
+                "agent_b_role": agent_b_id,
+                "agent_a_target_label": agent_a_role.target_label if agent_a_role else None,
+                "agent_b_target_label": agent_b_role.target_label if agent_b_role else None,
                 "agent_a_prediction": result_a.prediction,
                 "agent_b_prediction": result_b.prediction,
                 "agent_a_response": result_a.response_text,
@@ -235,6 +300,11 @@ def run_sample(
         "split": record["split"],
         "task_type": record["task_type"],
         "answer_type": record["answer_type"],
+        "role_mode": role_mode,
+        "agent_a_role": agent_a_id,
+        "agent_b_role": agent_b_id,
+        "agent_a_target_label": agent_a_role.target_label if agent_a_role else None,
+        "agent_b_target_label": agent_b_role.target_label if agent_b_role else None,
         "label": label,
         "verdict": verdict,
         "is_correct": is_correct,
@@ -265,6 +335,7 @@ def run_pipeline(
     temperature: float,
     output_dir: Path,
     save_hidden_states: bool = False,
+    role_mode: str = "persona",
 ) -> list[dict[str, Any]]:
     if rounds < 1:
         raise ValueError("rounds must be at least 1")
@@ -280,6 +351,7 @@ def run_pipeline(
                 temperature=temperature,
                 output_dir=output_dir,
                 save_hidden_states=save_hidden_states,
+                role_mode=role_mode,
             )
         )
     return summaries
@@ -295,6 +367,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.3)
+    parser.add_argument(
+        "--role-mode",
+        choices=ROLE_MODES,
+        default="persona",
+        help="persona keeps the original Agent A/B setup; stance uses ED2D-style task roles.",
+    )
     parser.add_argument("--agent-a-persona", default=DEFAULT_AGENT_A_PERSONA)
     parser.add_argument("--agent-b-persona", default=DEFAULT_AGENT_B_PERSONA)
     parser.add_argument("--save-hidden-states", action="store_true")
@@ -309,8 +387,14 @@ def main() -> None:
         records = records[: args.max_samples]
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    agent_a = QwenAgent(args.model, persona=args.agent_a_persona, dtype=args.dtype)
-    agent_b = QwenAgent(args.model, persona=args.agent_b_persona, dtype=args.dtype)
+    if args.role_mode == "stance":
+        agent_a_persona = DEFAULT_STANCE_AGENT_PERSONA
+        agent_b_persona = DEFAULT_STANCE_AGENT_PERSONA
+    else:
+        agent_a_persona = args.agent_a_persona
+        agent_b_persona = args.agent_b_persona
+    agent_a = QwenAgent(args.model, persona=agent_a_persona, dtype=args.dtype)
+    agent_b = QwenAgent(args.model, persona=agent_b_persona, dtype=args.dtype)
     summaries = run_pipeline(
         records,
         agent_a=agent_a,
@@ -320,6 +404,7 @@ def main() -> None:
         temperature=args.temperature,
         output_dir=args.output_dir,
         save_hidden_states=args.save_hidden_states,
+        role_mode=args.role_mode,
     )
     output_path = args.output_dir / args.output_name
     count = write_jsonl(summaries, output_path)
