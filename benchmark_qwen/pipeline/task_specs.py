@@ -97,3 +97,23 @@ def create_role_configs(record: dict[str, Any]) -> tuple[RoleConfig, RoleConfig]
         ),
     )
     return affirmative, negative
+
+
+def create_judge_role_config(record: dict[str, Any]) -> RoleConfig:
+    spec = get_task_spec(record.get("task_type"))
+    allowed_labels = ", ".join(spec.judge_labels)
+    maybe_guidance = ""
+    if "maybe" in spec.judge_labels:
+        maybe_guidance = " Use MAYBE when the evidence is mixed, insufficient, or inconclusive."
+
+    return RoleConfig(
+        name="Judge",
+        side="neutral",
+        target_label="",
+        meta_prompt=(
+            "You are the neutral judge in a debate. The affirmative and negative agents "
+            "were assigned opposing positions, so do not assume either side is correct. "
+            "Decide the best final answer based on the input evidence and the full debate "
+            f"transcript. Valid final labels are: {allowed_labels}.{maybe_guidance}"
+        ),
+    )

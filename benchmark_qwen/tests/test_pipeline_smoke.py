@@ -33,7 +33,10 @@ class DummyAgent:
         max_new_tokens=1024,
         temperature=0.3,
     ) -> AgentGeneration:
-        if not messages or "Previous debate transcript:" not in messages[0]["content"]:
+        if not messages:
+            raise AssertionError("pipeline did not pass any messages")
+        content = messages[0]["content"]
+        if "Previous debate transcript:" not in content and "Full debate transcript:" not in content:
             raise AssertionError("pipeline did not pass the expected FORD debate prompt")
         self.seen_messages.append(messages)
 
@@ -99,6 +102,9 @@ def test_pipeline_smoke() -> None:
         summary = summaries[0]
         require(summary["id"] == "strategyqa_dummy_001", "id mismatch")
         require(summary["verdict"] == "yes", "verdict should be consensus yes")
+        require(summary["verdict_source"] == "consensus", "persona verdict should come from consensus")
+        require(summary["resolved_verdict_mode"] == "consensus", "persona auto mode should resolve to consensus")
+        require(summary["judge_prediction"] is None, "persona consensus mode should not run a judge")
         require(summary["is_correct"] is True, "verdict should be correct")
         require(summary["error"] is False, "error should be false")
         require(summary["consensus"] is True, "agents should be in consensus")
@@ -119,7 +125,7 @@ def test_pipeline_smoke() -> None:
             require(Path(round_summary["agent_b_hidden_state_path"]).exists(), "B hidden state file missing")
 
 
-def test_stance_role_mode() -> None:
+def test_stance_role_mode_consensus_ablation() -> None:
     agent_a = DummyAgent(
         "Affirmative",
         vectors=[torch.tensor([[1.0, 0.0]])],
@@ -142,6 +148,7 @@ def test_stance_role_mode() -> None:
             temperature=0.0,
             output_dir=output_dir,
             role_mode="stance",
+            verdict_mode="consensus",
         )
 
         require(len(summaries) == 1, "expected one stance summary")
@@ -152,6 +159,7 @@ def test_stance_role_mode() -> None:
         require(summary["agent_a_target_label"] == "yes", "StrategyQA affirmative target should be yes")
         require(summary["agent_b_target_label"] == "no", "StrategyQA negative target should be no")
         require(summary["verdict"] == "unresolved", "opposing stance predictions should not be consensus")
+        require(summary["verdict_source"] == "consensus", "consensus ablation should use consensus verdict")
         require(summary["consensus"] is False, "opposing stance predictions should not be consensus")
 
         round_summary = summary["rounds"][0]
@@ -171,9 +179,67 @@ def test_stance_role_mode() -> None:
         require("target answer label is 'no'" in negative_prompt, "negative prompt should state target")
 
 
+def test_stance_judge_verdict_mode() -> None:
+    agent_a = DummyAgent(
+        "Affirmative",
+        vectors=[torch.tensor([[1.0, 0.0]])],
+        prediction="yes",
+    )
+    agent_b = DummyAgent(
+        "Negative",
+        vectors=[torch.tensor([[0.0, 1.0]])],
+        prediction="no",
+    )
+    judge = DummyAgent(
+        "Judge",
+        vectors=[torch.tensor([[0.9, 0.1]])],
+        prediction="yes",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_dir = Path(tmp_dir)
+        summaries = run_pipeline(
+            [sample_record()],
+            agent_a=agent_a,
+            agent_b=agent_b,
+            judge_agent=judge,
+            rounds=1,
+            max_new_tokens=32,
+            temperature=0.0,
+            output_dir=output_dir,
+            save_hidden_states=True,
+            role_mode="stance",
+            verdict_mode="auto",
+        )
+
+        require(len(summaries) == 1, "expected one judge summary")
+        summary = summaries[0]
+        require(summary["role_mode"] == "stance", "role mode should be stance")
+        require(summary["verdict_mode"] == "auto", "verdict mode should record requested value")
+        require(summary["resolved_verdict_mode"] == "judge", "stance auto mode should resolve to judge")
+        require(summary["verdict_source"] == "judge", "stance auto verdict should come from judge")
+        require(summary["judge_prediction"] == "yes", "judge prediction mismatch")
+        require(summary["verdict"] == "yes", "judge should set the final verdict")
+        require(summary["consensus_verdict"] == "unresolved", "side consensus should remain unresolved")
+        require(summary["is_correct"] is True, "judge verdict should be correct")
+        require(summary["error"] is False, "judge error should be false")
+        require(summary["judge_pooled_vector_shape"] == [1, 2], "judge vector shape mismatch")
+        require(summary["judge_generated_token_count"] > 0, "judge token count missing")
+        require(summary["judge_affirmative_disagreement"] < summary["judge_negative_disagreement"], "judge should be closer to affirmative")
+        require(summary["judge_closer_to"] == "affirmative", "judge alignment mismatch")
+        require(Path(summary["judge_hidden_state_path"]).exists(), "judge hidden state file missing")
+
+        judge_prompt = judge.seen_messages[0][0]["content"]
+        require("Full debate transcript:" in judge_prompt, "judge prompt should include full transcript")
+        require("neutral judge" in judge_prompt, "judge prompt should include neutral role instructions")
+        require("The debaters were assigned opposing positions" in judge_prompt, "judge prompt should warn about assigned sides")
+        require("Answer: (<choice letter>) <choice label>" in judge_prompt, "judge prompt should require answer format")
+
+
 def main() -> None:
     test_pipeline_smoke()
-    test_stance_role_mode()
+    test_stance_role_mode_consensus_ablation()
+    test_stance_judge_verdict_mode()
     print("[2-agent pipeline smoke test passed]")
 
 

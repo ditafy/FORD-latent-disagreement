@@ -18,7 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from benchmark_qwen.metrics.hidden_state_metrics import convergence_delta, pairwise_disagreement
 from benchmark_qwen.models.qwen_agent import AgentGeneration, QwenAgent
-from benchmark_qwen.pipeline.task_specs import RoleConfig, create_role_configs
+from benchmark_qwen.pipeline.task_specs import RoleConfig, create_judge_role_config, create_role_configs
 
 
 DEFAULT_AGENT_A_PERSONA = (
@@ -34,6 +34,7 @@ DEFAULT_STANCE_AGENT_PERSONA = (
     "argue from the assigned side, and keep the requested answer format."
 )
 ROLE_MODES = ("persona", "stance")
+VERDICT_MODES = ("auto", "consensus", "judge")
 
 
 class DebateAgent(Protocol):
@@ -150,12 +151,56 @@ def build_messages(
     return [{"role": "user", "content": content}]
 
 
+def build_judge_messages(
+    record: dict[str, Any],
+    *,
+    transcript: list[dict[str, Any]],
+    judge_role: RoleConfig,
+) -> list[dict[str, str]]:
+    content = (
+        f"Task type: {record['task_type']}\n"
+        f"Input:\n{record['text']}\n\n"
+        f"Choices: {choice_text(record['choices'])}\n\n"
+        f"Role instructions:\n{judge_role.meta_prompt}\n\n"
+        f"Full debate transcript:\n{render_transcript(transcript)}\n\n"
+        "Judge instruction:\n"
+        "Read the input, choices, and full debate transcript. The debaters were assigned opposing "
+        "positions, so evaluate their arguments critically and choose the best final answer. "
+        "Use exactly this format:\n"
+        "Answer: (<choice letter>) <choice label>\n"
+        "Explanation: <brief reason>"
+    )
+    return [{"role": "user", "content": content}]
+
+
+def resolve_verdict_mode(role_mode: str, verdict_mode: str) -> str:
+    if verdict_mode not in VERDICT_MODES:
+        raise ValueError(f"verdict_mode must be one of {VERDICT_MODES}, got {verdict_mode!r}")
+    if verdict_mode != "auto":
+        return verdict_mode
+    return "judge" if role_mode == "stance" else "consensus"
+
+
+def closer_to_judge(
+    judge_affirmative_disagreement: float,
+    judge_negative_disagreement: float,
+    *,
+    tolerance: float = 1e-6,
+) -> str:
+    delta = judge_affirmative_disagreement - judge_negative_disagreement
+    if abs(delta) <= tolerance:
+        return "tie"
+    if delta < 0:
+        return "affirmative"
+    return "negative"
+
+
 def maybe_save_hidden_state(
     hidden_state: torch.Tensor,
     *,
     output_dir: Path,
     sample_id: str,
-    round_index: int,
+    round_index: int | str,
     agent_key: str,
     save_hidden_states: bool,
 ) -> str | None:
@@ -172,15 +217,20 @@ def run_sample(
     *,
     agent_a: DebateAgent,
     agent_b: DebateAgent,
+    judge_agent: DebateAgent | None = None,
     rounds: int,
     max_new_tokens: int,
     temperature: float,
     output_dir: Path,
     save_hidden_states: bool = False,
     role_mode: str = "persona",
+    verdict_mode: str = "auto",
 ) -> dict[str, Any]:
     if role_mode not in ROLE_MODES:
         raise ValueError(f"role_mode must be one of {ROLE_MODES}, got {role_mode!r}")
+    resolved_verdict_mode = resolve_verdict_mode(role_mode, verdict_mode)
+    if resolved_verdict_mode == "judge" and judge_agent is None:
+        raise ValueError("judge_agent is required when verdict_mode resolves to 'judge'")
 
     transcript: list[dict[str, Any]] = []
     round_summaries: list[dict[str, Any]] = []
@@ -192,6 +242,8 @@ def run_sample(
         agent_a_role, agent_b_role = create_role_configs(record)
     agent_a_id = agent_a_role.name if agent_a_role else "Agent A"
     agent_b_id = agent_b_role.name if agent_b_role else "Agent B"
+    final_result_a: AgentGeneration | None = None
+    final_result_b: AgentGeneration | None = None
 
     for round_index in range(rounds):
         messages_a = build_messages(
@@ -239,6 +291,8 @@ def run_sample(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
         )
+        final_result_a = result_a
+        final_result_b = result_b
         hidden_b_path = maybe_save_hidden_state(
             result_b.pooled_hidden_state,
             output_dir=output_dir,
@@ -287,11 +341,69 @@ def run_sample(
     final_a = agent_a_predictions[-1]
     final_b = agent_b_predictions[-1]
     consensus = final_a == final_b and final_a != "unknown"
-    verdict = final_a if consensus else "unresolved"
     label = normalize_label(record["label"])
+    consensus_verdict = final_a if consensus else "unresolved"
+    verdict = consensus_verdict
+    verdict_source = "consensus"
+    judge_summary: dict[str, Any] = {
+        "judge_prediction": None,
+        "judge_response": None,
+        "judge_generated_token_count": None,
+        "judge_sequence_length": None,
+        "judge_pooled_vector_shape": None,
+        "judge_hidden_state_path": None,
+        "judge_affirmative_disagreement": None,
+        "judge_negative_disagreement": None,
+        "judge_closer_to": None,
+    }
+
+    if resolved_verdict_mode == "judge":
+        if final_result_a is None or final_result_b is None:
+            raise ValueError("judge verdict requires at least one completed debate round")
+        judge_role = create_judge_role_config(record)
+        judge_messages = build_judge_messages(record, transcript=transcript, judge_role=judge_role)
+        judge_result = judge_agent.generate(
+            judge_messages,
+            choices=record["choices"],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+        )
+        judge_hidden_path = maybe_save_hidden_state(
+            judge_result.pooled_hidden_state,
+            output_dir=output_dir,
+            sample_id=record["id"],
+            round_index="judge",
+            agent_key="judge",
+            save_hidden_states=save_hidden_states,
+        )
+        judge_affirmative_disagreement = pairwise_disagreement(
+            judge_result.pooled_hidden_state,
+            final_result_a.pooled_hidden_state,
+        )
+        judge_negative_disagreement = pairwise_disagreement(
+            judge_result.pooled_hidden_state,
+            final_result_b.pooled_hidden_state,
+        )
+        judge_summary = {
+            "judge_prediction": judge_result.prediction,
+            "judge_response": judge_result.response_text,
+            "judge_generated_token_count": judge_result.generated_token_count,
+            "judge_sequence_length": judge_result.sequence_length,
+            "judge_pooled_vector_shape": judge_result.pooled_vector_shape,
+            "judge_hidden_state_path": judge_hidden_path,
+            "judge_affirmative_disagreement": judge_affirmative_disagreement,
+            "judge_negative_disagreement": judge_negative_disagreement,
+            "judge_closer_to": closer_to_judge(
+                judge_affirmative_disagreement,
+                judge_negative_disagreement,
+            ),
+        }
+        verdict_source = "judge"
+        verdict = judge_result.prediction if judge_result.prediction != "unknown" else "unresolved"
+
     is_correct = None if verdict == "unresolved" else verdict == label
     error = None if is_correct is None else not is_correct
-    false_consensus = bool(consensus and verdict != label)
+    false_consensus = bool(consensus and consensus_verdict != label)
     initial_disagreement = round_summaries[0]["disagreement"]
     final_disagreement = round_summaries[-1]["disagreement"]
 
@@ -301,12 +413,16 @@ def run_sample(
         "task_type": record["task_type"],
         "answer_type": record["answer_type"],
         "role_mode": role_mode,
+        "verdict_mode": verdict_mode,
+        "resolved_verdict_mode": resolved_verdict_mode,
+        "verdict_source": verdict_source,
         "agent_a_role": agent_a_id,
         "agent_b_role": agent_b_id,
         "agent_a_target_label": agent_a_role.target_label if agent_a_role else None,
         "agent_b_target_label": agent_b_role.target_label if agent_b_role else None,
         "label": label,
         "verdict": verdict,
+        "consensus_verdict": consensus_verdict,
         "is_correct": is_correct,
         "error": error,
         "consensus": consensus,
@@ -320,6 +436,7 @@ def run_sample(
         "convergence_delta": convergence_delta(initial_disagreement, final_disagreement),
         "rounds": round_summaries,
     }
+    summary.update(judge_summary)
     for round_summary in round_summaries:
         summary[f"round{round_summary['round']}_disagreement"] = round_summary["disagreement"]
     return summary
@@ -330,12 +447,14 @@ def run_pipeline(
     *,
     agent_a: DebateAgent,
     agent_b: DebateAgent,
+    judge_agent: DebateAgent | None = None,
     rounds: int,
     max_new_tokens: int,
     temperature: float,
     output_dir: Path,
     save_hidden_states: bool = False,
     role_mode: str = "persona",
+    verdict_mode: str = "auto",
 ) -> list[dict[str, Any]]:
     if rounds < 1:
         raise ValueError("rounds must be at least 1")
@@ -346,12 +465,14 @@ def run_pipeline(
                 record,
                 agent_a=agent_a,
                 agent_b=agent_b,
+                judge_agent=judge_agent,
                 rounds=rounds,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 output_dir=output_dir,
                 save_hidden_states=save_hidden_states,
                 role_mode=role_mode,
+                verdict_mode=verdict_mode,
             )
         )
     return summaries
@@ -372,6 +493,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=ROLE_MODES,
         default="persona",
         help="persona keeps the original Agent A/B setup; stance uses ED2D-style task roles.",
+    )
+    parser.add_argument(
+        "--verdict-mode",
+        choices=VERDICT_MODES,
+        default="auto",
+        help="auto uses consensus for persona and judge for stance.",
     )
     parser.add_argument("--agent-a-persona", default=DEFAULT_AGENT_A_PERSONA)
     parser.add_argument("--agent-b-persona", default=DEFAULT_AGENT_B_PERSONA)
@@ -395,16 +522,22 @@ def main() -> None:
         agent_b_persona = args.agent_b_persona
     agent_a = QwenAgent(args.model, persona=agent_a_persona, dtype=args.dtype)
     agent_b = QwenAgent(args.model, persona=agent_b_persona, dtype=args.dtype)
+    resolved_verdict_mode = resolve_verdict_mode(args.role_mode, args.verdict_mode)
+    judge_agent = None
+    if resolved_verdict_mode == "judge":
+        judge_agent = QwenAgent(args.model, persona="You are a neutral debate judge.", dtype=args.dtype)
     summaries = run_pipeline(
         records,
         agent_a=agent_a,
         agent_b=agent_b,
+        judge_agent=judge_agent,
         rounds=args.rounds,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         output_dir=args.output_dir,
         save_hidden_states=args.save_hidden_states,
         role_mode=args.role_mode,
+        verdict_mode=args.verdict_mode,
     )
     output_path = args.output_dir / args.output_name
     count = write_jsonl(summaries, output_path)

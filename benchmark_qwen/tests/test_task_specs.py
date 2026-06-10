@@ -10,7 +10,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from benchmark_qwen.pipeline.task_specs import create_role_configs, get_task_spec  # noqa: E402
+from benchmark_qwen.pipeline.task_specs import create_judge_role_config, create_role_configs, get_task_spec  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -60,6 +60,25 @@ def test_create_role_configs() -> None:
     require("answer is NO" in negative.meta_prompt, "negative meta prompt should state the stance")
 
 
+def test_create_judge_role_config() -> None:
+    strategyqa_record = {
+        "id": "strategyqa_dummy_001",
+        "task_type": "strategyqa",
+        "choices": ["yes", "no"],
+    }
+    judge = create_judge_role_config(strategyqa_record)
+    require(judge.name == "Judge", "judge role name mismatch")
+    require(judge.side == "neutral", "judge side mismatch")
+    require(judge.target_label == "", "judge should not have a target label")
+    require("neutral judge" in judge.meta_prompt, "judge prompt should be neutral")
+    require("yes, no" in judge.meta_prompt, "judge prompt should list StrategyQA labels")
+
+    pubmedqa_judge = create_judge_role_config(
+        {"id": "pubmedqa_dummy_001", "task_type": "pubmedqa", "choices": ["yes", "no", "maybe"]}
+    )
+    require("MAYBE" in pubmedqa_judge.meta_prompt, "PubMedQA judge should receive MAYBE guidance")
+
+
 def test_validation_errors() -> None:
     require_raises(lambda: get_task_spec("unknown"), ValueError, "unknown task")
     require_raises(
@@ -72,6 +91,7 @@ def test_validation_errors() -> None:
 def main() -> None:
     test_task_specs()
     test_create_role_configs()
+    test_create_judge_role_config()
     test_validation_errors()
     print("[task specs tests passed]")
 
